@@ -1,6 +1,13 @@
 package com.zenika.snapshotmatcher;
 
-import static java.util.Arrays.asList;
+import com.google.common.util.concurrent.AtomicLongMap;
+import difflib.DiffUtils;
+import difflib.Patch;
+import org.hamcrest.Description;
+import org.hamcrest.Factory;
+import org.hamcrest.TypeSafeMatcher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -14,14 +21,15 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import org.hamcrest.Description;
-import org.hamcrest.Factory;
-import org.hamcrest.TypeSafeMatcher;
-
-import difflib.DiffUtils;
-import difflib.Patch;
+import static java.util.Arrays.asList;
 
 public class SnapshotMatcher<T> extends TypeSafeMatcher<T> {
+    private static final Logger LOG = LoggerFactory.getLogger(SnapshotMatcher.class);
+
+    public static AtomicLongMap<String> snapshotNameCountMap = AtomicLongMap.create();
+    private String snapshotName;
+    private Path snapshotPath;
+
     /**
      * Factory method to instantiate a snapshot matcher with the given type
      *
@@ -34,9 +42,24 @@ public class SnapshotMatcher<T> extends TypeSafeMatcher<T> {
     }
 
     /**
+     * Factory method to instantiate a snapshot matcher with the given type
+     *
+     * @param <T> Type of object to snapshot
+     * @return The snapshot matcher instance
+     */
+    @Factory
+    public static <T> SnapshotMatcher<T> matchesSnapshot(String snapshotName) {
+        return new SnapshotMatcher<>(snapshotName);
+    }
+
+    /**
      * Private constructor, use factory method {@link SnapshotMatcher#matchesSnapshot()} create a new matcher
      */
     private SnapshotMatcher() {
+    }
+
+    public SnapshotMatcher(String snapshotName) {
+        this.snapshotName = snapshotName;
     }
 
     private final DeterministicObjectMapper objectMapper = new DeterministicObjectMapper();
@@ -50,7 +73,13 @@ public class SnapshotMatcher<T> extends TypeSafeMatcher<T> {
             return compareSnapshot(o, snapshotPath);
         } else {
             // File doesn't exist => Create snapshot file and return true
-            createSnapshot(o, snapshotPath);
+            try {
+                createSnapshot(o, snapshotPath);
+            } catch (IOException e) {
+                LOG.error("Could not create new snapshot due to error: {}", e);
+                e.printStackTrace();
+                return false;
+            }
             return true;
         }
     }
@@ -61,17 +90,13 @@ public class SnapshotMatcher<T> extends TypeSafeMatcher<T> {
      * @param o            Object to serialize
      * @param snapshotPath Path to file to create
      */
-    private void createSnapshot(T o, Path snapshotPath) {
-        try {
-            Files.createDirectories(snapshotPath.getParent());
-            Files.createFile(snapshotPath);
+    private void createSnapshot(T o, Path snapshotPath) throws IOException {
+        Files.createDirectories(snapshotPath.getParent());
+        Files.createFile(snapshotPath);
 
-            try (BufferedWriter writer = Files.newBufferedWriter(snapshotPath, Charset.forName("UTF-8"))) {
-                objectMapper.writeValue(writer, o);
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+        BufferedWriter writer = Files.newBufferedWriter(snapshotPath, Charset.forName("UTF-8"));
+        objectMapper.writeValue(writer, o);
+        LOG.info("wrote new snapshot to path {}", snapshotPath.toString());
     }
 
     /**
@@ -97,13 +122,13 @@ public class SnapshotMatcher<T> extends TypeSafeMatcher<T> {
                 return true;
             } else {
                 System.out.print(
-                        patch.getDeltas().stream()
-                                .map(delta -> String.format("Expected\t<%s>\nbut found\t<%s>", delta.getOriginal(), delta.getRevised()))
-                                .collect(
-                                        Collectors.joining(
-                                                System.lineSeparator() + System.lineSeparator(),
-                                                String.format("Snapshot mismatch (%d differences found):\n", patch.getDeltas().size()),
-                                                System.lineSeparator())));
+                    patch.getDeltas().stream()
+                        .map(delta -> String.format("Expected\t<%s>\nbut found\t<%s>", delta.getOriginal(), delta.getRevised()))
+                        .collect(
+                            Collectors.joining(
+                                System.lineSeparator() + System.lineSeparator(),
+                                String.format("Snapshot mismatch (%d differences found):\n", patch.getDeltas().size()),
+                                System.lineSeparator())));
                 return false;
             }
         } catch (IOException e) {
@@ -124,12 +149,21 @@ public class SnapshotMatcher<T> extends TypeSafeMatcher<T> {
      * @return Path to the snapshot file
      */
     private Path getPath() {
+        if (this.snapshotPath != null) return this.snapshotPath;
+
         StackTraceElement caller = getCaller();
 
         String callerClassName = caller.getClassName().replace('.', '/');
         String callerMethodName = caller.getMethodName();
+        String snapshotName = String.format(
+            "%s/%s",
+            callerClassName,
+            this.snapshotName == null ? callerMethodName: this.snapshotName
+        );
+        snapshotName = String.format("%s-%d", snapshotName, snapshotNameCountMap.getAndIncrement(snapshotName));
 
-        return Paths.get(String.format("src/test/resources/snapshots/%s/%s.json", callerClassName, callerMethodName));
+        this.snapshotPath = Paths.get(String.format("src/test/resources/snapshots/%s.json", snapshotName));
+        return this.snapshotPath;
     }
 
     /**
@@ -141,16 +175,16 @@ public class SnapshotMatcher<T> extends TypeSafeMatcher<T> {
         final StackTraceElement[] stackTraceElements = Thread.currentThread().getStackTrace();
 
         return Stream.of(stackTraceElements)
-                // Filter out java.lang package
-                .filter(stackTraceElement -> !stackTraceElement.getClassName().startsWith(Thread.class.getPackage().getName()))
-                // Filter out org.hamcrest package
-                .filter(stackTraceElement -> !stackTraceElement.getClassName().startsWith(TypeSafeMatcher.class.getPackage().getName()))
-                // Filter out junit package
-                .filter(stackTraceElement -> !stackTraceElement.getClassName().startsWith("org.junit"))
-                // Filter out current class
-                .filter(stackTraceElement -> !stackTraceElement.getClassName().equals(SnapshotMatcher.class.getName()))
-                .findFirst()
-                .orElse(null);
+            // Filter out java.lang package
+            .filter(stackTraceElement -> !stackTraceElement.getClassName().startsWith(Thread.class.getPackage().getName()))
+            // Filter out org.hamcrest package
+            .filter(stackTraceElement -> !stackTraceElement.getClassName().startsWith(TypeSafeMatcher.class.getPackage().getName()))
+            // Filter out junit package
+            .filter(stackTraceElement -> !stackTraceElement.getClassName().startsWith("org.junit"))
+            // Filter out current class
+            .filter(stackTraceElement -> !stackTraceElement.getClassName().equals(SnapshotMatcher.class.getName()))
+            .findFirst()
+            .orElse(null);
     }
 
 }
